@@ -10,7 +10,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".ts", ".m2ts", ".hevc", ".avi", ".webm"}
+VIDEO_EXTENSIONS: set[str] = {".mp4", ".mkv", ".mov", ".ts", ".m2ts", ".hevc", ".avi", ".webm"}
+
+H265_CRF = "18"
+AUDIO_BITRATE = "192k"
+AUDIO_SAMPLE_RATE = 44100
+FFMPEG_PRESET = "medium"
+
+
+class VideoJoinerError(Exception):
+    """Raised when the video joining process cannot continue."""
 
 
 def check_ffmpeg() -> None:
@@ -51,7 +60,7 @@ def probe_video(path: Path) -> dict | None:
     try:
         result = subprocess.run(cmd, capture_output=True, check=True, text=True)
         data = json.loads(result.stdout)
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as e:
         print(f"  Warning: cannot probe {path.name}: {e}", file=sys.stderr)
         return None
 
@@ -135,9 +144,13 @@ def run_ffmpeg(cmd: list[str], total_duration: float) -> None:
         process.terminate()
         process.wait()
         sys.exit("\nAborted.")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
 
     if process.returncode != 0:
-        sys.exit(f"ffmpeg failed with exit code {process.returncode}")
+        raise VideoJoinerError(f"ffmpeg failed with exit code {process.returncode}")
 
 
 def join_copy(videos: list[Path], output: Path, total_duration: float) -> None:
@@ -198,11 +211,11 @@ def join_reencode(
 
         if has_any_audio:
             if p["has_audio"]:
-                filter_parts.append(f"[{i}:a:0]aresample=44100[a{i}]")
+                filter_parts.append(f"[{i}:a:0]aresample={AUDIO_SAMPLE_RATE}[a{i}]")
             else:
                 # Generate silent audio matching this clip's duration
                 filter_parts.append(
-                    f"anullsrc=r=44100:cl=stereo[silence{i}];"
+                    f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo[silence{i}];"
                     f"[silence{i}]atrim=duration={p['duration']}[a{i}]"
                 )
 
@@ -224,12 +237,12 @@ def join_reencode(
     ]
 
     if has_any_audio:
-        cmd.extend(["-map", "[outa]", "-c:a", "aac", "-b:a", "192k"])
+        cmd.extend(["-map", "[outa]", "-c:a", "aac", "-b:a", AUDIO_BITRATE])
 
     cmd.extend([
         "-c:v", "libx265",
-        "-crf", "18",
-        "-preset", "medium",
+        "-crf", H265_CRF,
+        "-preset", FFMPEG_PRESET,
         "-movflags", "+faststart",
         "-tag:v", "hvc1",
         output.as_posix(),
@@ -267,18 +280,18 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.directory.is_dir():
-        sys.exit(f"Error: {args.directory} is not a directory.")
+        raise VideoJoinerError(f"{args.directory} is not a directory.")
 
     check_ffmpeg()
 
     videos = find_videos(args.directory, args.pattern)
     if not videos:
-        sys.exit(f"No video files found in {args.directory}"
-                 + (f" matching '{args.pattern}'" if args.pattern else ""))
+        raise VideoJoinerError(f"No video files found in {args.directory}"
+                               + (f" matching '{args.pattern}'" if args.pattern else ""))
 
     output = args.output or args.directory / "joined.mp4"
     if output.exists():
-        sys.exit(f"Error: {output} already exists. Remove it or use -o to specify another path.")
+        raise VideoJoinerError(f"{output} already exists. Remove it or use -o to specify another path.")
 
     # Probe all files
     print(f"Found {len(videos)} files, probing...")
@@ -297,9 +310,10 @@ def main() -> None:
             print(f"  {v.name}  [SKIPPED — could not probe]")
 
     if skipped:
-        videos = [v for v in videos if v not in skipped]
+        skipped_set = set(skipped)
+        videos = [v for v in videos if v not in skipped_set]
         if not videos:
-            sys.exit("Error: no valid video files after probing.")
+            raise VideoJoinerError("No valid video files after probing.")
         print(f"\nSkipping {len(skipped)} unreadable file(s).")
 
     total_duration = sum(p["duration"] for p in probes)
@@ -332,4 +346,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except VideoJoinerError as e:
+        sys.exit(f"Error: {e}")
